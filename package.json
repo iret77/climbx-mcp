@@ -1,0 +1,42 @@
+{
+  "name": "climbx-mcp",
+  "version": "0.4.0",
+  "description": "MCP server for the ClimbX API (climbx.so): publish and schedule X posts, read analytics, voice profile, learnings, and outlier feeds.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "climbx-mcp": "dist/index.mjs"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "smoke": "tsx test/smoke.ts",
+    "start": "node dist/index.js",
+    "bundle": "npm run build && npm prune --omit=dev && npx -y @anthropic-ai/mcpb pack . climbx-mcp.mcpb && npm ci"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "climbx",
+    "x",
+    "twitter"
+  ],
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  }
+}
