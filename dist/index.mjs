@@ -21519,7 +21519,7 @@ function registerTools(server2, makeClient) {
 }
 
 // dist/index.js
-console.error(`[climbx-mcp] starting: node=${process.version} pid=${process.pid} execPath=${process.execPath} cwd=${process.cwd()} argv=${JSON.stringify(process.argv)}`);
+console.error(`[climbx-mcp] starting: node=${process.version} pid=${process.pid}`);
 var server = new McpServer({
   name: "climbx-mcp",
   version: "0.4.0"

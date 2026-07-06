@@ -15,10 +15,11 @@
   ],
   "scripts": {
     "build": "tsc",
+    "build:bin": "npm run build && esbuild dist/index.js --bundle --platform=node --format=esm --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\" --outfile=dist/index.mjs",
     "test": "vitest run",
     "smoke": "tsx test/smoke.ts",
-    "start": "node dist/index.js",
-    "bundle": "npm run build && npm prune --omit=dev && npx -y @anthropic-ai/mcpb pack . climbx-mcp.mcpb && npm ci"
+    "start": "node dist/index.mjs",
+    "bundle": "npm run build:bin && npm prune --omit=dev && npx -y @anthropic-ai/mcpb pack . climbx-mcp.mcpb && npm ci"
   },
   "engines": {
     "node": ">=20"
