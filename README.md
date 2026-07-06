@@ -17,10 +17,12 @@ An [MCP](https://modelcontextprotocol.io) server for the [ClimbX](https://climbx
 `npx` fetches and runs the committed self-contained bundle straight from this repo. No install, no build, and no npm account needed.
 
 ```bash
-CLIMBX_API_KEY=climbx_sk_... npx -y github:iret77/climbx-mcp
+# put the key in a file (mode 0600) so it never lands in shell history
+export CLIMBX_API_KEY_FILE=~/.climbx/api_key
+npx -y github:iret77/climbx-mcp
 ```
 
-Point any MCP client at that command. Examples:
+The server also reads `~/.climbx/api_key` by default, so with the key in that file you can just run `npx -y github:iret77/climbx-mcp`. Point any MCP client at that command. Examples:
 
 ### Claude Code
 
