@@ -16,5 +16,18 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run build
       - run: npm test
+      # The published entry point is the committed bundle dist/index.mjs. Rebuild it
+      # from source and fail if it drifts, so npx never serves stale code. esbuild is
+      # pinned via package-lock.json, so a fresh build is byte-identical.
+      - name: Bundle is reproducible from source
+        run: |
+          npm run build:bin
+          git diff --exit-code -- dist/index.mjs
+      # Smoke: the bundle loads, imports resolve, and the MCP server initializes.
+      - name: Server bundle boots over stdio
+        run: |
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            | timeout 5 node dist/index.mjs > boot.log 2>&1 || true
+          cat boot.log
+          grep -q "running on stdio" boot.log

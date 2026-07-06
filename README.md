@@ -4,37 +4,53 @@ An [MCP](https://modelcontextprotocol.io) server for the [ClimbX](https://climbx
 
 > **Community project.** Not affiliated with or endorsed by ClimbX. It wraps the official public API documented at [climbx.so/developers/docs](https://climbx.so/developers/docs).
 
-> **Want the finished workflow?** The [climbx-cowork Cowork plugin](../plugin/README.md) is built on this server and turns the raw tools into scanning, drafting in your voice, guarded publishing, a reply workflow, and a live dashboard. This README covers the standalone MCP server on its own.
+> **Want the finished workflow?** The [climbx-cowork Cowork plugin](https://github.com/iret77/climbx-cowork/blob/main/plugin/README.md) is built on this server and turns the raw tools into scanning, drafting in your voice, guarded publishing, a reply workflow, and a live dashboard. This README covers the standalone MCP server on its own.
 
 ## Requirements
 
 - A ClimbX account on an active plan or trial
-- A ClimbX API key: create one in the app under **Settings → API** (the full key is shown only once)
-- Node.js ≥ 20
+- A ClimbX API key: create one in the app under **Settings > API** (the full key is shown only once)
+- Node.js >= 20
 
-## Install
+## Run it
+
+`npx` fetches and runs the committed self-contained bundle straight from this repo. No install, no build, and no npm account needed.
+
+```bash
+CLIMBX_API_KEY=climbx_sk_... npx -y github:iret77/climbx-mcp
+```
+
+Point any MCP client at that command. Examples:
+
+### Claude Code
+
+Avoid typing the key inline (it would land in your shell history). Reference an environment variable instead, e.g. one loaded from your shell profile or a secret manager:
+
+```bash
+claude mcp add climbx --env CLIMBX_API_KEY="$CLIMBX_API_KEY" -- npx -y github:iret77/climbx-mcp
+```
+
+### Claude Desktop
+
+```json
+{
+  "mcpServers": {
+    "climbx": {
+      "command": "npx",
+      "args": ["-y", "github:iret77/climbx-mcp"],
+      "env": { "CLIMBX_API_KEY": "climbx_sk_..." }
+    }
+  }
+}
+```
+
+### Claude Cowork
+
+Install the [climbx-cowork plugin](https://github.com/iret77/climbx-cowork); it launches this server for you via the same `npx` command. You do not add this server separately.
 
 > **Zero-install alternative:** ClimbX hosts an official remote MCP server at `https://climbx.so/mcp` (HTTP transport, same Bearer key). This project is the community-built local stdio alternative wrapping the same API.
 
-### Claude Desktop: one-click bundle (easiest)
-
-1. Download [climbx-mcp.mcpb](https://github.com/iret77/climbx-cowork/releases/latest/download/climbx-mcp.mcpb) from the [latest release](https://github.com/iret77/climbx-cowork/releases/latest)
-2. Open it with Claude Desktop (double-click, or Settings > Extensions > drag it in)
-3. Enter your ClimbX API key when prompted; it is stored in the OS keychain
-
-No terminal needed. To build the bundle from source instead:
-
-```bash
-npm install
-npm run bundle
-```
-
-### From source (Claude Code and other MCP clients)
-
-```bash
-npm install
-npm run build
-```
+## Configuration
 
 The server reads its configuration from environment variables:
 
@@ -46,28 +62,6 @@ The server reads its configuration from environment variables:
 | `CLIMBX_ALLOW_CUSTOM_BASE_URL` | no | Set to `1` to allow a non-climbx.so base URL (dev/staging). Off by default so the key can't be sent to an unexpected host. |
 
 The key is resolved in this order: `CLIMBX_API_KEY`, then `CLIMBX_API_KEY_FILE`, then the default key file at `~/.climbx/api_key` (mode 0600) if it exists. Providing the key through a file (or the default path) keeps it out of your shell history and any config file.
-
-### Claude Code
-
-Avoid typing the key inline (it would land in your shell history). Reference an environment variable instead, e.g. one loaded from your shell profile or a secret manager:
-
-```bash
-claude mcp add climbx --env CLIMBX_API_KEY="$CLIMBX_API_KEY" -- node /path/to/climbx-mcp/dist/index.js
-```
-
-### Claude Desktop
-
-```json
-{
-  "mcpServers": {
-    "climbx": {
-      "command": "node",
-      "args": ["/path/to/climbx-mcp/dist/index.js"],
-      "env": { "CLIMBX_API_KEY": "climbx_sk_..." }
-    }
-  }
-}
-```
 
 ## Tools
 
@@ -102,10 +96,15 @@ claude mcp add climbx --env CLIMBX_API_KEY="$CLIMBX_API_KEY" -- node /path/to/cl
 ## Development
 
 ```bash
-npm test         # unit tests (mocked, no network)
-npm run smoke    # live read-only test against the real API (needs CLIMBX_API_KEY)
+npm install
+npm run build:bin   # tsc, then esbuild bundle -> dist/index.mjs (the published entry point)
+npm start           # run the bundle (node dist/index.mjs)
+npm test            # unit tests (mocked, no network)
+npm run smoke       # live read-only test against the real API (needs CLIMBX_API_KEY)
 npm run smoke -- --write   # + schedule/cancel roundtrip (consumes a daily-cap slot!)
 ```
+
+`dist/index.mjs` is a committed, self-contained bundle so `npx github:iret77/climbx-mcp` needs no install step. CI rebuilds it and fails if it drifts from source, so always run `npm run build:bin` and commit the result when you change `src/`.
 
 ## License
 
