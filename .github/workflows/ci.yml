@@ -9,11 +9,15 @@ jobs:
   tests:
     name: tests
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # engines requires node >=20; test the floor and current LTS.
+        node-version: [20, 22]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
       - run: npm test
@@ -24,10 +28,15 @@ jobs:
         run: |
           npm run build:bin
           git diff --exit-code -- dist/index.mjs
-      # Smoke: the bundle loads, imports resolve, and the MCP server initializes.
+      # Smoke: the bundle loads and the MCP server initializes. stderr carries the
+      # startup diagnostics; stdout must carry only the JSON-RPC protocol, so we
+      # assert the two streams separately and that stdout is not polluted.
       - name: Server bundle boots over stdio
         run: |
           printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
-            | timeout 5 node dist/index.mjs > boot.log 2>&1 || true
-          cat boot.log
-          grep -q "running on stdio" boot.log
+            | timeout 5 node dist/index.mjs >stdout.log 2>stderr.log || true
+          echo "--- stdout ---"; cat stdout.log
+          echo "--- stderr ---"; cat stderr.log
+          grep -q "running on stdio" stderr.log
+          grep -q '"jsonrpc"' stdout.log
+          if grep -q "\[climbx-mcp\] starting" stdout.log; then echo "startup log leaked into stdout"; exit 1; fi
