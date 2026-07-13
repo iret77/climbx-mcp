@@ -21110,29 +21110,37 @@ var DEFAULT_BASE_URL = "https://climbx.so/api/v1";
 function defaultKeyFilePath() {
   return join(homedir(), ".climbx", "api_key");
 }
+function sanitizeKey(value) {
+  const key = value?.trim();
+  if (!key)
+    return null;
+  if (key.includes("${"))
+    return null;
+  return key;
+}
 function readKeyFile(path) {
   try {
-    const key = readFileSync(path, "utf8").trim();
-    return key.length > 0 ? key : null;
+    return sanitizeKey(readFileSync(path, "utf8"));
   } catch {
     return null;
   }
 }
-function resolveApiKey() {
-  const envKey = process.env.CLIMBX_API_KEY?.trim();
+function resolveApiKeyWithSource() {
+  const envKey = sanitizeKey(process.env.CLIMBX_API_KEY);
   if (envKey)
-    return envKey;
+    return { key: envKey, source: "env" };
   const fileEnv = process.env.CLIMBX_API_KEY_FILE;
   if (fileEnv) {
     const fromFile = readKeyFile(fileEnv);
     if (fromFile)
-      return fromFile;
+      return { key: fromFile, source: "env_file" };
   }
-  return readKeyFile(defaultKeyFilePath());
+  const fromDefault = readKeyFile(defaultKeyFilePath());
+  return fromDefault ? { key: fromDefault, source: "key_file" } : null;
 }
 var ERROR_HINTS = {
-  missing_bearer: "No API key was sent. Set the CLIMBX_API_KEY environment variable.",
-  invalid_key: "The API key is unknown or revoked. Create a new one in ClimbX under Settings \u2192 API and update CLIMBX_API_KEY.",
+  missing_bearer: "No API key was sent. Call begin_key_setup for a guided local setup, or set the CLIMBX_API_KEY environment variable.",
+  invalid_key: "The API key is unknown or revoked. Create a new one in ClimbX under Settings \u2192 API, then call begin_key_setup to enter it (or update CLIMBX_API_KEY).",
   subscription_required: "The ClimbX account that owns this key has no active plan or trial. Check the subscription at climbx.so.",
   x_not_connected: "No X account is connected. Reconnect X in the ClimbX web app.",
   x_token_expired: "The X connection expired. Reconnect X in the ClimbX web app.",
@@ -21262,8 +21270,250 @@ var ClimbxClient = class {
   }
 };
 
+// dist/setup.js
+import { createServer } from "node:http";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+var DEFAULT_TTL_MS = 10 * 60 * 1e3;
+var MAX_ATTEMPTS = 10;
+var MAX_BODY_BYTES = 8 * 1024;
+var active = null;
+function tokenMatches(candidate, expected) {
+  if (!candidate || candidate.length !== expected.length)
+    return false;
+  return timingSafeEqual(Buffer.from(candidate), Buffer.from(expected));
+}
+function persistKey(key, filePath) {
+  mkdirSync(dirname(filePath), { recursive: true, mode: 448 });
+  writeFileSync(filePath, key, { encoding: "utf8", mode: 384 });
+  chmodSync(filePath, 384);
+}
+function closeKeySetup() {
+  if (!active)
+    return;
+  clearTimeout(active.timer);
+  active.server.close();
+  active = null;
+}
+function getKeySetupStatus() {
+  if (!active)
+    return { active: false };
+  return { active: true, url: active.url, expiresAt: active.expiresAt };
+}
+function beginKeySetup(opts) {
+  closeKeySetup();
+  const ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
+  const keyFilePath = opts.keyFilePath ?? defaultKeyFilePath();
+  const token = randomBytes(16).toString("hex");
+  const server2 = createServer((req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Connection", "close");
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    if (req.method === "GET" && url.pathname === "/setup") {
+      if (!active || !tokenMatches(url.searchParams.get("t"), active.token)) {
+        res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("This setup link is invalid or has expired. Ask Claude to run the ClimbX setup again.");
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; base-uri 'none'"
+      });
+      res.end(setupPageHtml());
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/key") {
+      let body = "";
+      let overflow = false;
+      req.on("data", (chunk) => {
+        body += chunk.toString("utf8");
+        if (body.length > MAX_BODY_BYTES) {
+          overflow = true;
+          req.destroy();
+        }
+      });
+      req.on("end", () => {
+        if (overflow)
+          return;
+        void handleSubmit(body, res, opts, keyFilePath);
+      });
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Not found.");
+  });
+  server2.on("connection", (socket) => socket.unref());
+  server2.unref();
+  return new Promise((resolve, reject) => {
+    server2.once("error", (err) => {
+      active = null;
+      reject(err);
+    });
+    server2.listen(0, "127.0.0.1", () => {
+      const address = server2.address();
+      if (address === null || typeof address === "string") {
+        server2.close();
+        active = null;
+        reject(new Error("Could not determine the setup listener port."));
+        return;
+      }
+      const sessionUrl = `http://127.0.0.1:${address.port}/setup?t=${token}`;
+      const expiresAt = new Date(Date.now() + ttlMs);
+      const timer = setTimeout(closeKeySetup, ttlMs);
+      timer.unref();
+      active = { server: server2, token, url: sessionUrl, expiresAt, attempts: 0, timer };
+      resolve({ url: sessionUrl, expiresAt });
+    });
+  });
+}
+async function handleSubmit(body, res, opts, keyFilePath) {
+  const respond = (status, payload) => {
+    res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(payload));
+  };
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    respond(400, { ok: false, message: "Malformed request." });
+    return;
+  }
+  if (!active || !tokenMatches(parsed.token ?? null, active.token)) {
+    respond(404, { ok: false, message: "This setup session is no longer valid. Ask Claude to run the setup again." });
+    return;
+  }
+  const key = parsed.key?.trim();
+  if (!key) {
+    respond(400, { ok: false, message: "Paste your ClimbX API key first." });
+    return;
+  }
+  active.attempts += 1;
+  if (active.attempts > MAX_ATTEMPTS) {
+    respond(429, { ok: false, message: "Too many attempts. Ask Claude to run the setup again." });
+    closeKeySetup();
+    return;
+  }
+  let result;
+  try {
+    result = await opts.validateKey(key);
+  } catch (err) {
+    respond(502, {
+      ok: false,
+      message: `Could not reach the ClimbX API to check the key: ${err instanceof Error ? err.message : String(err)}. Check your connection and try again.`
+    });
+    return;
+  }
+  if (!result.ok) {
+    respond(400, { ok: false, message: result.message ?? "ClimbX rejected this key." });
+    return;
+  }
+  try {
+    persistKey(key, keyFilePath);
+  } catch (err) {
+    respond(500, {
+      ok: false,
+      message: `The key is valid but could not be saved: ${err instanceof Error ? err.message : String(err)}`
+    });
+    return;
+  }
+  opts.onKeySaved(key);
+  respond(200, { ok: true });
+  setImmediate(closeKeySetup);
+}
+function setupPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Connect ClimbX</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; justify-content: center; align-items: center;
+    min-height: 100vh; margin: 0; padding: 1rem; box-sizing: border-box;
+    background: #fafafa; color: #1a1a1a;
+  }
+  @media (prefers-color-scheme: dark) { body { background: #0d0f13; color: #e8e8e8; } }
+  main { max-width: 26rem; width: 100%; }
+  h1 { font-size: 1.3rem; margin: 0 0 0.5rem; }
+  p { line-height: 1.5; margin: 0.5rem 0; }
+  .muted { opacity: 0.7; font-size: 0.85rem; }
+  input {
+    width: 100%; box-sizing: border-box; font-size: 1rem; font-family: ui-monospace, monospace;
+    padding: 0.6rem 0.7rem; margin: 0.8rem 0 0.6rem; border-radius: 8px;
+    border: 1px solid #8886; background: transparent; color: inherit;
+  }
+  button {
+    width: 100%; font-size: 1rem; padding: 0.6rem; border-radius: 8px;
+    border: none; background: #2563eb; color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #msg { min-height: 1.5rem; font-size: 0.9rem; }
+  #msg.error { color: #dc2626; }
+  #msg.okay { color: #16a34a; font-weight: 600; }
+  #done { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <div id="form">
+    <h1>Connect ClimbX</h1>
+    <p>Paste your ClimbX API key below. Create one in the ClimbX app under <strong>Settings &gt; API</strong> (the full key is shown only once).</p>
+    <input id="key" type="password" autocomplete="off" spellcheck="false" placeholder="climbx_sk_...">
+    <button id="save">Save and connect</button>
+    <p id="msg" role="status"></p>
+    <p class="muted">This page is served locally on your machine by the climbx-mcp server and closes itself after saving. The key is checked against climbx.so, stored only on this computer, and never enters the chat.</p>
+  </div>
+  <div id="done">
+    <h1>Connected.</h1>
+    <p>Your ClimbX key is saved. You can close this tab and go back to Claude.</p>
+  </div>
+</main>
+<script>
+  var token = new URLSearchParams(location.search).get("t");
+  var input = document.getElementById("key");
+  var button = document.getElementById("save");
+  var msg = document.getElementById("msg");
+  function submit() {
+    var key = input.value.trim();
+    if (!key) { msg.className = "error"; msg.textContent = "Paste your ClimbX API key first."; return; }
+    button.disabled = true;
+    msg.className = ""; msg.textContent = "Checking the key with ClimbX...";
+    fetch("/api/key", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: token, key: key })
+    }).then(function (res) { return res.json(); }).then(function (data) {
+      if (data.ok) {
+        document.getElementById("form").style.display = "none";
+        document.getElementById("done").style.display = "block";
+      } else {
+        button.disabled = false;
+        msg.className = "error"; msg.textContent = data.message || "ClimbX rejected this key.";
+      }
+    }).catch(function () {
+      button.disabled = false;
+      msg.className = "error";
+      msg.textContent = "The setup session ended before the key was saved. Ask Claude to run the setup again.";
+    });
+  }
+  button.addEventListener("click", submit);
+  input.addEventListener("keydown", function (e) { if (e.key === "Enter") submit(); });
+  input.focus();
+</script>
+</body>
+</html>
+`;
+}
+
 // dist/tools.js
-var SETUP_HINT = "No ClimbX API key found. Create an API key in ClimbX under Settings \u2192 API (https://climbx.so/account/settings/api), then provide it in any one of these ways: set the CLIMBX_API_KEY environment variable, point CLIMBX_API_KEY_FILE at a file containing the key, or place the key in ~/.climbx/api_key (mode 0600). The key is shown only once at creation.";
+var SETUP_HINT = "No ClimbX API key is configured. Call begin_key_setup to get a one-time local link where the user can paste their key into a secure form (the key never enters the chat). Power users can instead set the CLIMBX_API_KEY environment variable, point CLIMBX_API_KEY_FILE at a file containing the key, or place the key in ~/.climbx/api_key (mode 0600). Keys are created in ClimbX under Settings \u2192 API (https://climbx.so/account/settings/api) and shown only once.";
 function findUrlInText(text) {
   const match = text.match(/\bhttps?:\/\/\S+|\bwww\.\S+/i);
   return match ? match[0] : null;
@@ -21320,6 +21570,13 @@ var windowFields = {
 };
 function registerTools(server2, makeClient) {
   let client = null;
+  function buildClient(apiKey) {
+    return new ClimbxClient({
+      apiKey,
+      baseUrl: process.env.CLIMBX_BASE_URL ?? DEFAULT_BASE_URL,
+      allowCustomHost: process.env.CLIMBX_ALLOW_CUSTOM_BASE_URL === "1"
+    });
+  }
   function getClient() {
     if (client)
       return client;
@@ -21327,14 +21584,10 @@ function registerTools(server2, makeClient) {
       client = makeClient();
       return client;
     }
-    const apiKey = resolveApiKey();
-    if (!apiKey)
+    const resolved = resolveApiKeyWithSource();
+    if (!resolved)
       return null;
-    client = new ClimbxClient({
-      apiKey,
-      baseUrl: process.env.CLIMBX_BASE_URL ?? DEFAULT_BASE_URL,
-      allowCustomHost: process.env.CLIMBX_ALLOW_CUSTOM_BASE_URL === "1"
-    });
+    client = buildClient(resolved.key);
     return client;
   }
   function run(handler) {
@@ -21349,6 +21602,57 @@ function registerTools(server2, makeClient) {
       }
     };
   }
+  async function validateKeyLive(key) {
+    try {
+      await buildClient(key).get("/voice");
+      return { ok: true };
+    } catch (err) {
+      if (err instanceof ClimbxError) {
+        if (err.code === "network_error" || err.code === "timeout")
+          throw err;
+        return { ok: false, message: err.hint ?? `ClimbX rejected this key (${err.code}).` };
+      }
+      throw err;
+    }
+  }
+  server2.registerTool("get_key_status", {
+    title: "API key status",
+    description: "Reports whether a ClimbX API key is configured and where it came from (environment, key file), without making a network call and without ever revealing the key itself. Also reports whether a key-setup session from begin_key_setup is currently open. Use it first when connecting an account or diagnosing auth errors.",
+    inputSchema: {}
+  }, async () => {
+    const resolved = resolveApiKeyWithSource();
+    const rawEnv = process.env.CLIMBX_API_KEY;
+    const setup = getKeySetupStatus();
+    return ok({
+      configured: resolved !== null,
+      source: resolved?.source ?? null,
+      key_tail: resolved ? `...${resolved.key.slice(-4)}` : null,
+      // True when the host passed an unresolved ${...} template through
+      // CLIMBX_API_KEY (a known plugin-config gap); the value was ignored.
+      ignored_env_placeholder: Boolean(rawEnv?.trim()) && sanitizeKey(rawEnv) === null,
+      setup: setup.active ? { active: true, url: setup.url, expires_at: setup.expiresAt?.toISOString() } : { active: false }
+    });
+  });
+  server2.registerTool("begin_key_setup", {
+    title: "Start guided key setup",
+    description: "Starts a one-time, local-only key-setup page served by this MCP server on 127.0.0.1 and returns its URL. Show that URL to the user as a clickable link: the page has a masked field where they paste their ClimbX API key (created in ClimbX under Settings > API), validates it live, stores it in ~/.climbx/api_key on this machine, and then shuts itself down. The new key takes effect immediately, no restart needed. Never ask the user to paste the key into the chat. The link expires after 10 minutes; call this tool again for a fresh one. Calling it again also invalidates the previous link. Check progress with get_key_status.",
+    inputSchema: {}
+  }, async () => {
+    try {
+      const session = await beginKeySetup({
+        validateKey: validateKeyLive,
+        onKeySaved: (key) => {
+          client = buildClient(key);
+        }
+      });
+      return ok({
+        url: session.url,
+        expires_at: session.expiresAt.toISOString()
+      }, "Show this link to the user and ask them to open it and paste their ClimbX API key there. It only works on this machine and expires after 10 minutes. Once they confirm, verify with get_key_status (configured: true) and a get_voice_profile call.");
+    } catch (err) {
+      return fail(`Could not start the local key-setup page: ${err instanceof Error ? err.message : String(err)}. Fall back to the manual options: set CLIMBX_API_KEY in the plugin's connector settings, or place the key in ~/.climbx/api_key (mode 0600).`);
+    }
+  });
   server2.registerTool("publish_post", {
     title: "Publish a post now",
     description: "Publish a post to X immediately through the connected ClimbX account. Counts toward the daily cap of 5 posts per account per day (publish and schedule combined, resets 00:00 UTC). Posts containing URLs are rejected. Attach up to 4 images via image_urls.",
@@ -21522,9 +21826,15 @@ function registerTools(server2, makeClient) {
 console.error(`[climbx-mcp] starting: node=${process.version} pid=${process.pid}`);
 var server = new McpServer({
   name: "climbx-mcp",
-  version: "0.4.0"
+  version: "0.5.0"
 });
 registerTools(server);
+function shutdownOnHangup() {
+  closeKeySetup();
+  setTimeout(() => process.exit(0), 500).unref();
+}
+process.stdin.once("end", shutdownOnHangup);
+process.stdin.once("close", shutdownOnHangup);
 var transport = new StdioServerTransport();
 await server.connect(transport);
 console.error("climbx-mcp running on stdio");

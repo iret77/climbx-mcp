@@ -1,6 +1,6 @@
 {
   "name": "climbx-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "MCP server for the ClimbX API (climbx.so): publish and schedule X posts, read analytics, voice profile, learnings, and outlier feeds.",
   "license": "MIT",
   "type": "module",
