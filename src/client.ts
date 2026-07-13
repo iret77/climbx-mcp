@@ -12,14 +12,34 @@ export function defaultKeyFilePath(): string {
   return join(homedir(), ".climbx", "api_key");
 }
 
+/**
+ * Normalizes a candidate key. Returns null for empty values and for unresolved
+ * config placeholders: plugin hosts that fail to substitute `${user_config.X}`
+ * (or any `${...}` form) pass the template string through literally, and
+ * treating it as a real key would both fail every request with invalid_key and
+ * shadow the key-file fallbacks below.
+ */
+export function sanitizeKey(value: string | undefined | null): string | null {
+  const key = value?.trim();
+  if (!key) return null;
+  if (key.includes("${")) return null;
+  return key;
+}
+
 /** Reads a key file, trimming surrounding whitespace. Returns null if missing, unreadable, or empty. */
 function readKeyFile(path: string): string | null {
   try {
-    const key = readFileSync(path, "utf8").trim();
-    return key.length > 0 ? key : null;
+    return sanitizeKey(readFileSync(path, "utf8"));
   } catch {
     return null;
   }
+}
+
+export type ApiKeySource = "env" | "env_file" | "key_file";
+
+export interface ResolvedApiKey {
+  key: string;
+  source: ApiKeySource;
 }
 
 /**
@@ -27,27 +47,35 @@ function readKeyFile(path: string): string | null {
  *   1. the CLIMBX_API_KEY environment variable
  *   2. the file named by CLIMBX_API_KEY_FILE
  *   3. the default key file at ~/.climbx/api_key
- * Returns null when no source yields a non-empty key (callers show the setup hint).
+ * Values that are empty or look like unresolved `${...}` placeholders are
+ * skipped so the next source gets its turn. Returns null when no source yields
+ * a usable key (callers show the setup hint).
  */
-export function resolveApiKey(): string | null {
-  const envKey = process.env.CLIMBX_API_KEY?.trim();
-  if (envKey) return envKey;
+export function resolveApiKeyWithSource(): ResolvedApiKey | null {
+  const envKey = sanitizeKey(process.env.CLIMBX_API_KEY);
+  if (envKey) return { key: envKey, source: "env" };
 
   const fileEnv = process.env.CLIMBX_API_KEY_FILE;
   if (fileEnv) {
     const fromFile = readKeyFile(fileEnv);
-    if (fromFile) return fromFile;
+    if (fromFile) return { key: fromFile, source: "env_file" };
   }
 
-  return readKeyFile(defaultKeyFilePath());
+  const fromDefault = readKeyFile(defaultKeyFilePath());
+  return fromDefault ? { key: fromDefault, source: "key_file" } : null;
+}
+
+/** Key-only variant of resolveApiKeyWithSource, kept for existing callers. */
+export function resolveApiKey(): string | null {
+  return resolveApiKeyWithSource()?.key ?? null;
 }
 
 /** Actionable hints per ClimbX error code (see https://climbx.so/developers/docs). */
 const ERROR_HINTS: Record<string, string> = {
   missing_bearer:
-    "No API key was sent. Set the CLIMBX_API_KEY environment variable.",
+    "No API key was sent. Call begin_key_setup for a guided local setup, or set the CLIMBX_API_KEY environment variable.",
   invalid_key:
-    "The API key is unknown or revoked. Create a new one in ClimbX under Settings → API and update CLIMBX_API_KEY.",
+    "The API key is unknown or revoked. Create a new one in ClimbX under Settings → API, then call begin_key_setup to enter it (or update CLIMBX_API_KEY).",
   subscription_required:
     "The ClimbX account that owns this key has no active plan or trial. Check the subscription at climbx.so.",
   x_not_connected:

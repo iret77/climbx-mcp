@@ -1,13 +1,21 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ClimbxClient, ClimbxError, DEFAULT_BASE_URL, resolveApiKey } from "./client.js";
+import {
+  ClimbxClient,
+  ClimbxError,
+  DEFAULT_BASE_URL,
+  resolveApiKeyWithSource,
+  sanitizeKey,
+} from "./client.js";
+import { beginKeySetup, getKeySetupStatus } from "./setup.js";
 
 const SETUP_HINT =
-  "No ClimbX API key found. Create an API key in ClimbX under Settings → API " +
-  "(https://climbx.so/account/settings/api), then provide it in any one of these ways: " +
-  "set the CLIMBX_API_KEY environment variable, point CLIMBX_API_KEY_FILE at a file " +
-  "containing the key, or place the key in ~/.climbx/api_key (mode 0600). " +
-  "The key is shown only once at creation.";
+  "No ClimbX API key is configured. Call begin_key_setup to get a one-time local link " +
+  "where the user can paste their key into a secure form (the key never enters the chat). " +
+  "Power users can instead set the CLIMBX_API_KEY environment variable, point " +
+  "CLIMBX_API_KEY_FILE at a file containing the key, or place the key in " +
+  "~/.climbx/api_key (mode 0600). Keys are created in ClimbX under Settings → API " +
+  "(https://climbx.so/account/settings/api) and shown only once.";
 
 /** Mirrors the server-side rejection of URLs so a doomed request never spends quota. */
 export function findUrlInText(text: string): string | null {
@@ -91,20 +99,24 @@ const windowFields = {
 export function registerTools(server: McpServer, makeClient?: () => ClimbxClient): void {
   let client: ClimbxClient | null = null;
 
+  function buildClient(apiKey: string): ClimbxClient {
+    // Base-URL validation happens inside the ClimbxClient constructor.
+    return new ClimbxClient({
+      apiKey,
+      baseUrl: process.env.CLIMBX_BASE_URL ?? DEFAULT_BASE_URL,
+      allowCustomHost: process.env.CLIMBX_ALLOW_CUSTOM_BASE_URL === "1",
+    });
+  }
+
   function getClient(): ClimbxClient | null {
     if (client) return client;
     if (makeClient) {
       client = makeClient();
       return client;
     }
-    const apiKey = resolveApiKey();
-    if (!apiKey) return null;
-    // Base-URL validation happens inside the ClimbxClient constructor.
-    client = new ClimbxClient({
-      apiKey,
-      baseUrl: process.env.CLIMBX_BASE_URL ?? DEFAULT_BASE_URL,
-      allowCustomHost: process.env.CLIMBX_ALLOW_CUSTOM_BASE_URL === "1",
-    });
+    const resolved = resolveApiKeyWithSource();
+    if (!resolved) return null;
+    client = buildClient(resolved.key);
     return client;
   }
 
@@ -120,6 +132,90 @@ export function registerTools(server: McpServer, makeClient?: () => ClimbxClient
       }
     };
   }
+
+  /** Live-checks a candidate key against the API. Used by the key-setup page. */
+  async function validateKeyLive(key: string): Promise<{ ok: boolean; message?: string }> {
+    try {
+      await buildClient(key).get("/voice");
+      return { ok: true };
+    } catch (err) {
+      if (err instanceof ClimbxError) {
+        if (err.code === "network_error" || err.code === "timeout") throw err;
+        return { ok: false, message: err.hint ?? `ClimbX rejected this key (${err.code}).` };
+      }
+      throw err;
+    }
+  }
+
+  server.registerTool(
+    "get_key_status",
+    {
+      title: "API key status",
+      description:
+        "Reports whether a ClimbX API key is configured and where it came from (environment, key file), " +
+        "without making a network call and without ever revealing the key itself. Also reports whether a " +
+        "key-setup session from begin_key_setup is currently open. Use it first when connecting an account " +
+        "or diagnosing auth errors.",
+      inputSchema: {},
+    },
+    async (): Promise<ToolResult> => {
+      const resolved = resolveApiKeyWithSource();
+      const rawEnv = process.env.CLIMBX_API_KEY;
+      const setup = getKeySetupStatus();
+      return ok({
+        configured: resolved !== null,
+        source: resolved?.source ?? null,
+        key_tail: resolved ? `...${resolved.key.slice(-4)}` : null,
+        // True when the host passed an unresolved ${...} template through
+        // CLIMBX_API_KEY (a known plugin-config gap); the value was ignored.
+        ignored_env_placeholder: Boolean(rawEnv?.trim()) && sanitizeKey(rawEnv) === null,
+        setup: setup.active
+          ? { active: true, url: setup.url, expires_at: setup.expiresAt?.toISOString() }
+          : { active: false },
+      });
+    },
+  );
+
+  server.registerTool(
+    "begin_key_setup",
+    {
+      title: "Start guided key setup",
+      description:
+        "Starts a one-time, local-only key-setup page served by this MCP server on 127.0.0.1 and returns " +
+        "its URL. Show that URL to the user as a clickable link: the page has a masked field where they " +
+        "paste their ClimbX API key (created in ClimbX under Settings > API), validates it live, stores it " +
+        "in ~/.climbx/api_key on this machine, and then shuts itself down. The new key takes effect " +
+        "immediately, no restart needed. Never ask the user to paste the key into the chat. The link " +
+        "expires after 10 minutes; call this tool again for a fresh one. Calling it again also invalidates " +
+        "the previous link. Check progress with get_key_status.",
+      inputSchema: {},
+    },
+    async (): Promise<ToolResult> => {
+      try {
+        const session = await beginKeySetup({
+          validateKey: validateKeyLive,
+          onKeySaved: (key) => {
+            client = buildClient(key);
+          },
+        });
+        return ok(
+          {
+            url: session.url,
+            expires_at: session.expiresAt.toISOString(),
+          },
+          "Show this link to the user and ask them to open it and paste their ClimbX API key there. " +
+            "It only works on this machine and expires after 10 minutes. Once they confirm, verify with " +
+            "get_key_status (configured: true) and a get_voice_profile call.",
+        );
+      } catch (err) {
+        return fail(
+          `Could not start the local key-setup page: ${err instanceof Error ? err.message : String(err)}. ` +
+            "Fall back to the manual options: set CLIMBX_API_KEY in the plugin's connector settings, or " +
+            "place the key in ~/.climbx/api_key (mode 0600).",
+        );
+      }
+    },
+  );
 
   server.registerTool(
     "publish_post",

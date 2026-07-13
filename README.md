@@ -22,7 +22,7 @@ export CLIMBX_API_KEY_FILE=~/.climbx/api_key
 npx -y github:iret77/climbx-mcp
 ```
 
-The server also reads `~/.climbx/api_key` by default, so with the key in that file you can just run `npx -y github:iret77/climbx-mcp`. Point any MCP client at that command. Examples:
+The server also reads `~/.climbx/api_key` by default, so with the key in that file you can just run `npx -y github:iret77/climbx-mcp`. Starting without any key works too: ask your agent to set up ClimbX and the built-in [guided key setup](#guided-key-setup-no-terminal-needed) takes it from there. Point any MCP client at that command. Examples:
 
 ### Claude Code
 
@@ -63,12 +63,24 @@ The server reads its configuration from environment variables:
 | `CLIMBX_BASE_URL` | no | API base URL. Defaults to `https://climbx.so/api/v1`. Must be an https `climbx.so` URL unless `CLIMBX_ALLOW_CUSTOM_BASE_URL=1` is set. |
 | `CLIMBX_ALLOW_CUSTOM_BASE_URL` | no | Set to `1` to allow a non-climbx.so base URL (dev/staging). Off by default so the key can't be sent to an unexpected host. |
 
-The key is resolved in this order: `CLIMBX_API_KEY`, then `CLIMBX_API_KEY_FILE`, then the default key file at `~/.climbx/api_key` (mode 0600) if it exists. Providing the key through a file (or the default path) keeps it out of your shell history and any config file.
+The key is resolved in this order: `CLIMBX_API_KEY`, then `CLIMBX_API_KEY_FILE`, then the default key file at `~/.climbx/api_key` (mode 0600) if it exists. Providing the key through a file (or the default path) keeps it out of your shell history and any config file. Values that are empty or look like an unresolved `${...}` config placeholder (which some plugin hosts pass through literally) are ignored so the next source can take over.
+
+### Guided key setup (no terminal needed)
+
+If no key is configured, any client can run the built-in setup flow instead of touching files or environment variables:
+
+1. The agent calls `begin_key_setup`. The server opens a one-time page on `127.0.0.1` (random port, single-use token, 10 minute lifetime) and returns its URL.
+2. The user opens the link, pastes their ClimbX API key into a masked field, and the server validates it live against the API.
+3. On success the key is saved to `~/.climbx/api_key` (directory 0700, file 0600), takes effect immediately in the running server, and the page shuts down.
+
+The key never passes through the chat, the MCP client, or a config file. The listener runs inside the MCP server process itself: nothing extra is spawned, every handle is `unref()`ed, and it closes on success, on expiry, on repeated failures, and when the server shuts down. When the MCP host hangs up stdio, the server process exits by itself, so no listener or process is ever left behind.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
+| `get_key_status` | Whether a key is configured and from which source (never reveals the key) |
+| `begin_key_setup` | Start the guided local key setup and return its one-time URL |
 | `publish_post` | Publish a post to X immediately (text + up to 4 image URLs) |
 | `list_posts` | Recent published posts with metrics (impressions, likes, replies, and more) |
 | `schedule_post` | Queue a post for a future time |

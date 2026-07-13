@@ -7,6 +7,8 @@ import {
   ClimbxError,
   defaultKeyFilePath,
   resolveApiKey,
+  resolveApiKeyWithSource,
+  sanitizeKey,
   validateBaseUrl,
 } from "../src/client.js";
 import { findUrlInText, validateImageUrls, validateIsoDate } from "../src/tools.js";
@@ -165,7 +167,7 @@ describe("inspiration endpoints", () => {
 });
 
 describe("tool wiring", () => {
-  it("registers all 16 tools and routes them to the right endpoints", async () => {
+  it("registers all 18 tools and routes them to the right endpoints", async () => {
     const { registerTools } = await import("../src/tools.js");
     const calls: string[] = [];
     const fetchFn = vi.fn(async (url: any) => {
@@ -184,10 +186,11 @@ describe("tool wiring", () => {
     );
 
     expect([...handlers.keys()].sort()).toEqual([
-      "cancel_scheduled", "get_analytics", "get_following_outliers", "get_format_performance",
-      "get_inspiration_options", "get_learnings", "get_learnings_history", "get_niche_performance",
-      "get_surprise_outliers", "get_voice_profile", "list_posts", "list_scheduled",
-      "publish_post", "reschedule_post", "schedule_post", "suggest_reply",
+      "begin_key_setup", "cancel_scheduled", "get_analytics", "get_following_outliers",
+      "get_format_performance", "get_inspiration_options", "get_key_status", "get_learnings",
+      "get_learnings_history", "get_niche_performance", "get_surprise_outliers", "get_voice_profile",
+      "list_posts", "list_scheduled", "publish_post", "reschedule_post", "schedule_post",
+      "suggest_reply",
     ]);
 
     const res = await handlers.get("get_following_outliers")!({ handles: "@levelsio", limit: 5 });
@@ -358,5 +361,50 @@ describe("resolveApiKey", () => {
     vi.stubEnv("CLIMBX_API_KEY", "   ");
     vi.stubEnv("CLIMBX_API_KEY_FILE", file);
     expect(resolveApiKey()).toBeNull();
+  });
+
+  // Plugin hosts that fail to substitute userConfig pass the ${user_config.X}
+  // template through literally; treating it as a key would poison every request
+  // AND shadow the key-file fallback.
+  it("treats an unresolved ${...} placeholder in CLIMBX_API_KEY as absent and falls through", () => {
+    const home = tempHome();
+    mkdirSync(join(home, ".climbx"));
+    writeKeyFile(join(home, ".climbx"), "api_key", "climbx_sk_from_file");
+    vi.stubEnv("CLIMBX_API_KEY", "${user_config.CLIMBX_API_KEY}");
+    vi.stubEnv("CLIMBX_API_KEY_FILE", undefined);
+    expect(resolveApiKey()).toBe("climbx_sk_from_file");
+  });
+
+  it("returns null for a placeholder env key when no fallback exists", () => {
+    tempHome();
+    vi.stubEnv("CLIMBX_API_KEY", "${user_config.CLIMBX_API_KEY}");
+    vi.stubEnv("CLIMBX_API_KEY_FILE", undefined);
+    expect(resolveApiKey()).toBeNull();
+  });
+
+  it("reports the source of the resolved key", () => {
+    const home = tempHome();
+    mkdirSync(join(home, ".climbx"));
+    writeKeyFile(join(home, ".climbx"), "api_key", "climbx_sk_default");
+    vi.stubEnv("CLIMBX_API_KEY", undefined);
+    vi.stubEnv("CLIMBX_API_KEY_FILE", undefined);
+    expect(resolveApiKeyWithSource()).toEqual({ key: "climbx_sk_default", source: "key_file" });
+    vi.stubEnv("CLIMBX_API_KEY", "climbx_sk_env");
+    expect(resolveApiKeyWithSource()).toEqual({ key: "climbx_sk_env", source: "env" });
+  });
+});
+
+describe("sanitizeKey", () => {
+  it("passes normal keys through trimmed", () => {
+    expect(sanitizeKey("  climbx_sk_abc \n")).toBe("climbx_sk_abc");
+  });
+
+  it("rejects empty, undefined, and placeholder values", () => {
+    expect(sanitizeKey(undefined)).toBeNull();
+    expect(sanitizeKey("")).toBeNull();
+    expect(sanitizeKey("   ")).toBeNull();
+    expect(sanitizeKey("${user_config.CLIMBX_API_KEY}")).toBeNull();
+    expect(sanitizeKey("${CLIMBX_API_KEY}")).toBeNull();
+    expect(sanitizeKey("prefix-${VAR}-suffix")).toBeNull();
   });
 });
